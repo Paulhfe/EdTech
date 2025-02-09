@@ -1,4 +1,4 @@
-const { db, admin } = require("../services/firebase");
+const { db, admin } = require("./firebase");
 
 // Add Quiz (Admin Only)
 const addQuiz = async (req, res) => {
@@ -113,8 +113,8 @@ const fetchQuiz = async (req, res) => {
 const submitQuiz = async (req, res) => {
   try {
     const { id } = req.params;
-    const userId = req.user.userId;
-    const {answers } = req.body; // User ID and answers
+    const userId = req.user.userId || req.admin.adminId;
+    const { answers } = req.body; // User ID and answers
 
     if (!userId || !answers || typeof answers !== "object") {
       return res.status(400).json({ message: "Invalid request data" });
@@ -123,15 +123,18 @@ const submitQuiz = async (req, res) => {
     const db = admin.firestore();
     const quizRef = db.collection("quizzes").doc(id);
     const userRef = db.collection("users").doc(userId);
+    const adminRef = db.collection("admins").doc(userId);
 
     const quizSnapshot = await quizRef.get();
     const userSnapshot = await userRef.get();
+    const adminSnapshot = await adminRef.get();
 
     if (!quizSnapshot.exists) {
       return res.status(404).json({ message: "Quiz not found" });
     }
-    if (!userSnapshot.exists) {
-      return res.status(404).json({ message: "User not found" });
+
+    if (!userSnapshot.exists && !adminSnapshot.exists) {
+      return res.status(404).json({ message: "User/Admin not found" });
     }
 
     const quizData = quizSnapshot.data();
@@ -139,14 +142,28 @@ const submitQuiz = async (req, res) => {
     const totalQuestions = quizData.questions.length;
 
     // Check if the user has already taken the quiz
-    const userData = userSnapshot.data();
-    let quizzesTaken = userData.quizzesTaken || [];
-    const quizRecord = quizzesTaken.find((q) => q.id === id);
+    let quizzesTaken = userSnapshot.exists
+      ? userSnapshot.data().quizzesTaken || []
+      : adminSnapshot.exists
+      ? null
+      : undefined;
 
-    if (quizRecord) {
-      return res
-        .status(400)
-        .json({ message: "You have already taken this quiz" });
+    if (!adminSnapshot.exists && userSnapshot.exists) {
+      const quizRecord = quizzesTaken.find((q) => q.id === id);
+      if (quizRecord) {
+        return res
+          .status(400)
+          .json({ message: "You have already taken this quiz" });
+      }
+
+      quizzesTaken.push({
+        id,
+        score,
+        totalQuestions,
+        timestamp: new Date().toISOString(),
+      });
+
+      await userRef.update({ quizzesTaken });
     }
 
     // Calculate Score
@@ -157,40 +174,94 @@ const submitQuiz = async (req, res) => {
     });
 
     // Update Quiz Attempts
-    const newQuizAttempts = (quizData.quizAttempts || 0) + 1;
-    await quizRef.update({ quizAttempts: newQuizAttempts });
+    const username = userSnapshot.exists
+      ? userSnapshot.data().username
+      : adminSnapshot.exists
+      ? null
+      : undefined;
 
-    // Update User's Quizzes Taken
+    let quizAttempts = userSnapshot.exists
+      ? quizData.quizAttempts || []
+      : adminSnapshot.exists
+      ? null
+      : undefined;
 
-    // Add quiz attempt if not already recorded
-    if (!quizRecord) {
-      quizzesTaken.push({
-        id,
-        score,
-        totalQuestions,
-        timestamp: new Date().toISOString(),
-      });
+    if (userSnapshot.exists) {
+      const userRecord = quizAttempts.find((q) => q === username);
+      if (!userRecord) {
+        quizAttempts.push(username);
+      }
+
+      await quizRef.update({ quizAttempts });
     }
-
-    await userRef.update({ quizzesTaken });
 
     return res.status(200).json({
       message: "Quiz submitted successfully",
       score,
       totalQuestions,
-      quizAttempts: newQuizAttempts,
+      percentage: `${(score / totalQuestions) * 100}%`,
     });
   } catch (error) {
     console.error("Error submitting quiz:", error);
-    return res.status(500).json({ message: "Internal server error" });
+    return res.status(500).json({ message: "Internal server error", error });
   }
 };
 
 // Fetch Scores for a User
 const fetchUserScore = async (req, res) => {
   try {
-    const { id } = req.params;
-    const userId = req.user.userId; // Extract user ID from the authenticated request
+    const { id } = req.params.id;
+    let userId = req.user.userId; // Extract user ID from the authenticated request
+
+    if (!user) {
+      userId = req.params.userId;
+    } else {
+      userId = req.user.userId;
+    }
+
+    console.log(userId);
+
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized access" });
+    }
+
+    const db = admin.firestore();
+    const userRef = db.collection("users").doc(userId);
+    const quizRef = db.collection("quizzes").doc(id);
+
+    const userSnapshot = await userRef.get();
+    const quizSnapshot = await quizRef.get();
+
+    if (!userSnapshot.exists) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    if (!quizSnapshot.exists) {
+      return res.status(404).json({ message: "Quiz not found" });
+    }
+
+    const userData = userSnapshot.data();
+    const quizData = quizSnapshot.data();
+
+    // Find the quiz in the user's taken quizzes
+    const quizRecord = userData.quizzesTaken?.find((q) => q.id === id);
+
+    if (!quizRecord) {
+      return res.status(404).json({ message: "Quiz not taken by this user" });
+    }
+
+    return res.status(200).json({
+      quizTitle: quizData.title,
+      score: quizRecord.score,
+      totalQuestions: quizRecord.totalQuestions,
+    });
+  } catch (error) {
+    console.error("Error fetching user score:", error);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+};
+const fetchUserScoreForAdmin = async (req, res) => {
+  try {
+    const { id, userId } = req.params;
 
     if (!userId) {
       return res.status(401).json({ message: "Unauthorized access" });
@@ -281,5 +352,6 @@ module.exports = {
   fetchQuiz,
   submitQuiz,
   fetchUserScore,
+  fetchUserScoreForAdmin,
   fetchAllUserScores,
 };
